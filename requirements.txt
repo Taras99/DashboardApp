@@ -1,0 +1,14 @@
+streamlit
+yfinance
+pandas
+numpy
+plotly
+matplotlib
+joblib
+scikit-learn
+# optional for  RL algorithms
+stable-baselines3
+torch
+gym
+# optional wrapper (for custom package)
+# gym_trading_env
