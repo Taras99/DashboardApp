@@ -72,29 +72,29 @@ class StockRLDashboard:
         return selected, period, interval
     
     def _render_price_metrics(self, df: pd.DataFrame):
-        """Render price metrics section."""
-        latest_close = df['Close'].iloc[-1]
-        prev_close = df['Close'].iloc[-2] if len(df) > 1 else latest_close
-        change = latest_close - prev_close
-        pct_change = 100.0 * change / prev_close if prev_close != 0 else 0.0
+        """Render price metrics based on the loaded DataFrame."""
+        try:
+            # Ensure we're working with single values, not Series
+            close_prices = df['Close'].dropna()
+            if len(close_prices) < 2:
+                st.warning("Not enough data points to calculate changes")
+                return
+                
+            latest_close = close_prices.iloc[-1]
+            prev_close = close_prices.iloc[-2]
+            
+            # Calculate changes
+            change = latest_close - prev_close
+            pct_change = 100.0 * change / prev_close if prev_close != 0 else 0.0
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Last Close", f"${latest_close:.2f}", f"${change:.2f}")
-        col2.metric("Change (%)", f"{pct_change:.2f}%")
-        col3.metric("Rows", f"{len(df)}")
+            # Display metrics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Last Close", f"${latest_close:.2f}", f"${change:.2f}")
+            col2.metric("Change (%)", f"{pct_change:.2f}%")
+            col3.metric("Rows", f"{len(df)}")
 
-        # Show statistics if available
-        if st.session_state.stats is not None:
-            st.subheader("Price Statistics")
-            st.dataframe(st.session_state.stats.style.format({
-                'mean': '{:.2f}',
-                'median': '{:.2f}',
-                'mode': '{:.2f}',
-                'min': '{:.2f}',
-                'max': '{:.2f}',
-                'std_dev': '{:.2f}',
-                'variance': '{:.2f}'
-            }))
+        except Exception as e:
+            st.error(f"Error rendering price metrics: {str(e)}")
     
     def _render_simulation_section(self, df: pd.DataFrame):
         """Render the trading simulation section."""
