@@ -129,7 +129,7 @@ class StockRLDashboard:
         with st.spinner("Running simulation..."):
             while not done and iters < 10000:
                 action = agent.act(obs)
-                obs, reward, done, info = env.step(action)
+                obs, reward,terminated, done, info = env.step(action)
                 iters += 1
         
         st.success("Simulation finished")
