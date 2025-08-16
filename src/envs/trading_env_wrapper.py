@@ -202,3 +202,77 @@ def create_trading_env_from_df(
     except Exception as e:
         warnings.warn(f"External TradingEnv failed: {str(e)}. Using SimpleTradingEnv.")
         return SimpleTradingEnv(df=df, initial_balance=initial_balance, trading_fees=trading_fees)
+    
+
+class EnhancedTradingEnv(SimpleTradingEnv):
+    def __init__(self, df: pd.DataFrame, initial_balance: float = 10000.0, 
+                 trading_fees: float = 0.001, max_position_pct: float = 0.1):
+        super().__init__(df, initial_balance, trading_fees)
+        self.max_position_pct = max_position_pct  # Max % of capital per trade
+        self.drawdown_threshold = 0.2  # Max allowed drawdown
+        self.peak_balance = initial_balance
+
+    def step(self, action: int) -> Tuple[Dict[str, float], float, bool, Dict[str, Any]]:
+        try:
+            if self.step_idx >= len(self.df) - 1:
+                return self._obs(), 0.0, True, {'portfolio_valuation': self.balance}
+            
+            price = self._get_price(self.step_idx)
+            prev_portfolio_val = self.balance + (self.shares * price * self.position if self.position != 0 else 0)
+            
+            # Handle position changes with risk management
+            if action != self.position:
+                # Close existing position
+                if self.position != 0:
+                    pnl = (price - self.entry_price) * self.position * self.shares
+                    self.balance += pnl
+                    self.shares = 0.0
+                
+                # Open new position with position sizing
+                if action != 0:
+                    max_invest = self.balance * self.max_position_pct
+                    self.shares = max_invest / price
+                    self.entry_price = price
+                    self.balance -= max_invest * self.trading_fees
+                
+                self.position = action
+            
+            # Calculate new portfolio value
+            portfolio_val = self.balance + (self.shares * price * self.position if self.position != 0 else 0)
+            self.peak_balance = max(self.peak_balance, portfolio_val)
+            
+            # Calculate drawdown
+            current_drawdown = (self.peak_balance - portfolio_val) / self.peak_balance
+            if current_drawdown >= self.drawdown_threshold:
+                return self._obs(), -100.0, True, {'portfolio_valuation': portfolio_val, 'termination': 'drawdown'}
+            
+            # Update history
+            self.history['step'].append(self.step_idx)
+            self.history['price'].append(price)
+            self.history['position'].append(self.position)
+            self.history['portfolio_valuation'].append(portfolio_val)
+            
+            self.step_idx += 1
+            done = self.step_idx >= len(self.df) - 1
+            
+            # Risk-adjusted reward calculation
+            reward = self._calculate_reward(prev_portfolio_val, portfolio_val)
+            
+            return self._obs(), reward, done, {'portfolio_valuation': portfolio_val}
+            
+        except Exception as e:
+            return self._obs(), 0.0, True, {'error': str(e)}
+
+    def _calculate_reward(self, prev_val: float, current_val: float) -> float:
+        """Calculate risk-adjusted reward"""
+        raw_return = (current_val - prev_val) / prev_val if prev_val != 0 else 0
+        
+        # Add penalty for large positions
+        position_penalty = abs(self.position) * 0.01  # 1% penalty per position unit
+        
+        # Add volatility component
+        price_changes = np.diff([x for x in self.history['price'][-10:] if x is not None])
+        volatility = np.std(price_changes) if len(price_changes) > 1 else 0
+        volatility_penalty = volatility * 0.5
+        
+        return raw_return - position_penalty - volatility_penalty
