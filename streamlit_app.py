@@ -2,8 +2,8 @@
 import streamlit as st
 import pandas as pd
 from src.data_loader import StockDataService
-from src.envs.trading_env_wrapper import create_trading_env_from_df
-from src.agents.sma_agent import SMAAgent
+from src.envs.trading_env_wrapper import EnhancedTradingEnv
+from src.agents.sma_agent import EnhancedSMAAgent
 from src.viz.plots import plot_price, plot_portfolio_history, plot_trades_on_price
 from typing import Optional, Tuple, Dict
 
@@ -104,17 +104,13 @@ class StockRLDashboard:
         initial_balance = st.number_input("Initial balance", value=10000.0, step=1000.0)
         trading_fees = st.number_input("Trading fee (fraction)", value=0.001, step=0.0001, format="%.4f")
 
-        env = create_trading_env_from_df(
-            df, 
-            initial_balance=initial_balance, 
-            trading_fees=trading_fees
-        )
+        env =  EnhancedTradingEnv(df, initial_balance=10000, trading_fees=0.001, max_position_pct=0.1)
 
         agent_choice = st.selectbox("Agent", ["SMA"])
         if agent_choice == "SMA":
             short = st.number_input("SMA short window", value=5, step=1)
             long = st.number_input("SMA long window", value=20, step=1)
-            agent = SMAAgent(short_window=short, long_window=long)
+            agent = EnhancedSMAAgent(short_window=10, long_window=50, confirmation_pct=0.015)
 
         if st.button("Run simulation"):
             self._run_simulation(env, agent)
@@ -129,7 +125,7 @@ class StockRLDashboard:
         with st.spinner("Running simulation..."):
             while not done and iters < 10000:
                 action = agent.act(obs)
-                obs, reward,terminated, done, info = env.step(action)
+                obs, reward, done, info = env.step(action)
                 iters += 1
         
         st.success("Simulation finished")
@@ -169,3 +165,4 @@ class StockRLDashboard:
 if __name__ == "__main__":
     dashboard = StockRLDashboard()
     dashboard.run()
+
