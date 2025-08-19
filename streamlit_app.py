@@ -1,9 +1,10 @@
-# streamlit_app.py
 import streamlit as st
 import pandas as pd
+import numpy as np
 from src.data_loader import StockDataService
 from src.envs.trading_env_wrapper import EnhancedTradingEnv
 from src.agents.sma_agent import EnhancedSMAAgent
+from src.agents.lstm_agent import LSTMSMAAgent  # New import
 from src.viz.plots import plot_price, plot_portfolio_history, plot_trades_on_price
 from typing import Optional, Tuple, Dict
 
@@ -27,6 +28,8 @@ class StockRLDashboard:
             st.session_state.interval = '1d'
         if 'stats' not in st.session_state:
             st.session_state.stats = None
+        if 'lstm_trained' not in st.session_state:
+            st.session_state.lstm_trained = False
     
     def _setup_page_config(self):
         """Configure Streamlit page settings."""
@@ -64,6 +67,7 @@ class StockRLDashboard:
                 st.session_state.selected_ticker = selected
                 st.session_state.period = period
                 st.session_state.interval = interval
+                st.session_state.lstm_trained = False  # Reset training flag
                 st.success(f"Loaded {len(result['data'])} rows for {selected}")
             except Exception as e:
                 st.error(f"Failed to load data: {str(e)}")
@@ -74,7 +78,6 @@ class StockRLDashboard:
     def _render_price_metrics(self, df: pd.DataFrame):
         """Render price metrics based on the loaded DataFrame."""
         try:
-            # Ensure we're working with single values, not Series
             close_prices = df['Close'].dropna()
             if len(close_prices) < 2:
                 st.warning("Not enough data points to calculate changes")
@@ -88,10 +91,11 @@ class StockRLDashboard:
             pct_change = 100.0 * change / prev_close if prev_close != 0 else 0.0
 
             # Display metrics
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Last Close", f"${latest_close:.2f}", f"${change:.2f}")
-            col2.metric("Change (%)", f"{pct_change:.2f}%")
-            col3.metric("Rows", f"{len(df)}")
+            cols = st.columns(4)
+            cols[0].metric("Last Close", f"${latest_close:.2f}", f"${change:.2f}")
+            cols[1].metric("Change (%)", f"{pct_change:.2f}%")
+            cols[2].metric("52W High", f"${close_prices.max():.2f}")
+            cols[3].metric("52W Low", f"${close_prices.min():.2f}")
 
         except Exception as e:
             st.error(f"Error rendering price metrics: {str(e)}")
@@ -103,45 +107,184 @@ class StockRLDashboard:
         
         initial_balance = st.number_input("Initial balance", value=10000.0, step=1000.0)
         trading_fees = st.number_input("Trading fee (fraction)", value=0.001, step=0.0001, format="%.4f")
+        max_position = st.slider("Max position size (%)", 1, 100, 10) / 100
 
-        env =  EnhancedTradingEnv(df, initial_balance=10000, trading_fees=0.001, max_position_pct=0.1)
+        env = EnhancedTradingEnv(
+            df, 
+            initial_balance=initial_balance, 
+            trading_fees=trading_fees,
+            max_position_pct=max_position
+        )
 
-        agent_choice = st.selectbox("Agent", ["SMA"])
+        agent_choice = st.selectbox("Agent", ["SMA", "LSTM-SMA"])
+        
         if agent_choice == "SMA":
-            short = st.number_input("SMA short window", value=5, step=1)
-            long = st.number_input("SMA long window", value=20, step=1)
-            agent = EnhancedSMAAgent(short_window=10, long_window=50, confirmation_pct=0.015)
+            col1, col2 = st.columns(2)
+            short = col1.number_input("SMA short window", value=5, min_value=1, max_value=50)
+            long = col2.number_input("SMA long window", value=20, min_value=2, max_value=200)
+            confirmation = st.slider("Confirmation threshold (%)", 0.1, 5.0, 1.0) / 100
+            
+            agent = EnhancedSMAAgent(
+                short_window=short,
+                long_window=long,
+                confirmation_pct=confirmation
+            )
+            
+        elif agent_choice == "LSTM-SMA":
+            col1, col2 = st.columns(2)
+            short = col1.number_input("SMA short window", value=5, min_value=1, max_value=50)
+            long = col2.number_input("SMA long window", value=20, min_value=2, max_value=200)
+            
+            st.markdown("**LSTM Parameters**")
+            col3, col4 = st.columns(2)
+            lookback = col3.number_input("Lookback window", value=60, min_value=10, max_value=200)
+            horizon = col4.number_input("Prediction horizon", value=30, min_value=5, max_value=90)
+            epochs = st.number_input("Training epochs", value=50, min_value=1, max_value=200)
+            
+            agent = LSTMSMAAgent(
+                short_window=short,
+                long_window=long,
+                lookback=lookback,
+                forecast_horizon=horizon
+            )
+            
+            # Train button separate from run
+            if st.button("Train LSTM Model"):
+                with st.spinner("Training LSTM model..."):
+                    train_size = int(0.8 * len(df))
+                    # Pass the Close column values directly as a Series
+                    close_prices = df['Close'].iloc[:train_size]
+                    agent.train(close_prices)
+                    st.session_state.lstm_trained = True
+                    st.success("LSTM model trained successfully!")
+            
+            if not st.session_state.lstm_trained:
+                st.warning("Please train the LSTM model before running simulation")
 
         if st.button("Run simulation"):
-            self._run_simulation(env, agent)
+            if agent_choice == "LSTM-SMA" and not st.session_state.lstm_trained:
+                st.error("LSTM model must be trained first!")
+            else:
+                self._run_simulation(env, agent)
     
     def _run_simulation(self, env, agent):
         """Execute the trading simulation."""
         obs = env.reset()
         done = False
         agent.reset()
-        iters = 0
         
-        with st.spinner("Running simulation..."):
-            while not done and iters < 10000:
-                action = agent.act(obs)
-                obs, reward, done, info = env.step(action)
-                iters += 1
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        max_steps = len(env.df) - 1
         
-        st.success("Simulation finished")
-        st.write(f"Final portfolio value: ${info['portfolio_valuation']:.2f}")
-
-        # Show results
-        hist = getattr(env, "history", None)
-        if hist:
-            st.plotly_chart(plot_portfolio_history(hist), use_container_width=True)
-            st.plotly_chart(plot_trades_on_price(st.session_state.df, hist), use_container_width=True)
+        results = {
+            'actions': [],
+            'rewards': [],
+            'portfolio_values': [],
+            'positions': []
+        }
+        
+        for step in range(max_steps):
+            # Update progress
+            progress = int(100 * (step / max_steps))
+            progress_bar.progress(progress)
+            status_text.text(f"Processing step {step+1}/{max_steps}...")
+            
+            # Run simulation step
+            action = agent.act(obs)
+            obs, reward, done, info = env.step(action)
+            
+            # Store results
+            results['actions'].append(action)
+            results['rewards'].append(reward)
+            results['portfolio_values'].append(info['portfolio_valuation'])
+            results['positions'].append(obs['position'])
+            
+            if done:
+                break
+        
+        # Store results in session state
+        st.session_state.simulation_results = {
+            'env_history': getattr(env, 'history', {}),
+            'metrics': self._calculate_performance_metrics(results),
+            'raw_results': results
+        }
+        
+        # Display completion message
+        progress_bar.progress(100)
+        status_text.text("Simulation complete!")
+        st.success("Trading simulation finished successfully")
+        
+        # Display results
+        self._render_simulation_results()
     
-    def _render_data_preview(self, df: pd.DataFrame):
-        """Render the raw data preview section."""
-        st.markdown("---")
-        st.subheader("Raw data preview")
-        st.dataframe(df.tail(200))
+    def _calculate_performance_metrics(self, results: Dict) -> Dict:
+        """Calculate key performance metrics from simulation results."""
+        portfolio_values = results['portfolio_values']
+        returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        
+        total_return = (portfolio_values[-1] / portfolio_values[0] - 1) * 100
+        annualized_return = (1 + total_return/100)**(252/len(portfolio_values)) - 1
+        
+        volatility = np.std(returns) * np.sqrt(252)
+        sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
+        
+        max_drawdown = (np.maximum.accumulate(portfolio_values) - portfolio_values) / \
+                      np.maximum.accumulate(portfolio_values)
+        max_drawdown = np.max(max_drawdown) * 100 if len(max_drawdown) > 0 else 0
+        
+        win_rate = len([r for r in returns if r > 0]) / len(returns) if len(returns) > 0 else 0
+        
+        return {
+            'total_return_pct': total_return,
+            'annualized_return_pct': annualized_return * 100,
+            'volatility_pct': volatility * 100,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown_pct': max_drawdown,
+            'win_rate_pct': win_rate * 100,
+            'final_value': portfolio_values[-1]
+        }
+    
+    def _render_simulation_results(self):
+        """Enhanced results visualization with multiple tabs."""
+        if not st.session_state.simulation_results:
+            st.warning("No simulation results available")
+            return
+            
+        results = st.session_state.simulation_results
+        metrics = results['metrics']
+        
+        # Display key metrics
+        st.subheader("Performance Summary")
+        cols = st.columns(4)
+        cols[0].metric("Final Value", f"${metrics['final_value']:,.2f}")
+        cols[1].metric("Total Return", f"{metrics['total_return_pct']:.2f}%")
+        cols[2].metric("Annualized Return", f"{metrics['annualized_return_pct']:.2f}%")
+        cols[3].metric("Max Drawdown", f"{metrics['max_drawdown_pct']:.2f}%")
+        
+        # Create tabs for different visualizations
+        tab1, tab2, tab3 = st.tabs(["Portfolio Value", "Trades", "Advanced Metrics"])
+        
+        with tab1:
+            st.plotly_chart(
+                plot_portfolio_history(results['env_history']), 
+                use_container_width=True
+            )
+        
+        with tab2:
+            st.plotly_chart(
+                plot_trades_on_price(st.session_state.df, results['env_history']), 
+                use_container_width=True
+            )
+        
+        with tab3:
+            st.subheader("Risk/Reward Analysis")
+            col1, col2 = st.columns(2)
+            col1.metric("Volatility", f"{metrics['volatility_pct']:.2f}%")
+            col2.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+            
+            st.subheader("Trade Statistics")
+            st.write(f"Win Rate: {metrics['win_rate_pct']:.1f}%")
     
     def run(self):
         """Main method to run the dashboard."""
@@ -151,18 +294,20 @@ class StockRLDashboard:
             df = st.session_state.df
             selected = st.session_state.selected_ticker
             
-            st.subheader(f"{selected} price")
-            fig_price = plot_price(df)
-            st.plotly_chart(fig_price, use_container_width=True)
+            st.header(f"{selected} Analysis ({period}, {interval})")
+            st.plotly_chart(plot_price(df), use_container_width=True)
             
             self._render_price_metrics(df)
             self._render_simulation_section(df)
-            self._render_data_preview(df)
+            
+            if st.session_state.simulation_results:
+                self._render_simulation_results()
+            
+            with st.expander("Raw Data Preview"):
+                st.dataframe(df.tail(200))
         else:
-            st.info("Load a ticker from the sidebar and click 'Load data' to begin.")
+            st.info("Please select a ticker and load data from the sidebar to begin.")
 
-# Main entry point
 if __name__ == "__main__":
     dashboard = StockRLDashboard()
     dashboard.run()
-
