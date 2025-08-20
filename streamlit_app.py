@@ -4,7 +4,8 @@ import numpy as np
 from src.data_loader import StockDataService
 from src.envs.trading_env_wrapper import EnhancedTradingEnv
 from src.agents.sma_agent import EnhancedSMAAgent
-from src.agents.lstm_agent import LSTMSMAAgent  # New import
+from src.agents.lstm_agent import LSTMSMAAgent
+from src.agents.statistical_agent import StatisticalMeanAgent, EnhancedStatisticalAgent  # New imports
 from src.viz.plots import plot_price, plot_portfolio_history, plot_trades_on_price
 from typing import Optional, Tuple, Dict
 
@@ -30,6 +31,8 @@ class StockRLDashboard:
             st.session_state.stats = None
         if 'lstm_trained' not in st.session_state:
             st.session_state.lstm_trained = False
+        if 'stat_agent_trained' not in st.session_state:
+            st.session_state.stat_agent_trained = False
     
     def _setup_page_config(self):
         """Configure Streamlit page settings."""
@@ -38,7 +41,7 @@ class StockRLDashboard:
             layout="wide", 
             initial_sidebar_state="expanded"
         )
-        st.title("📈 Stock analysis & RL trading dashboard")
+        st.title("📈 Stock Analysis & RL Trading Dashboard")
     
     def _render_sidebar(self) -> Tuple[Optional[str], str, str]:
         """Render sidebar controls and return user selections."""
@@ -67,7 +70,8 @@ class StockRLDashboard:
                 st.session_state.selected_ticker = selected
                 st.session_state.period = period
                 st.session_state.interval = interval
-                st.session_state.lstm_trained = False  # Reset training flag
+                st.session_state.lstm_trained = False  # Reset training flags
+                st.session_state.stat_agent_trained = False
                 st.success(f"Loaded {len(result['data'])} rows for {selected}")
             except Exception as e:
                 st.error(f"Failed to load data: {str(e)}")
@@ -116,7 +120,7 @@ class StockRLDashboard:
             max_position_pct=max_position
         )
 
-        agent_choice = st.selectbox("Agent", ["SMA", "LSTM-SMA"])
+        agent_choice = st.selectbox("Agent", ["SMA", "LSTM-SMA", "Statistical Mean", "Enhanced Statistical"])
         
         if agent_choice == "SMA":
             col1, col2 = st.columns(2)
@@ -152,7 +156,6 @@ class StockRLDashboard:
             if st.button("Train LSTM Model"):
                 with st.spinner("Training LSTM model..."):
                     train_size = int(0.8 * len(df))
-                    # Pass the Close column values directly as a Series
                     close_prices = df['Close'].iloc[:train_size]
                     agent.train(close_prices)
                     st.session_state.lstm_trained = True
@@ -160,10 +163,64 @@ class StockRLDashboard:
             
             if not st.session_state.lstm_trained:
                 st.warning("Please train the LSTM model before running simulation")
+                
+        elif agent_choice == "Statistical Mean":
+            st.markdown("**Statistical Mean Parameters**")
+            col1, col2 = st.columns(2)
+            long_threshold = col1.number_input("Long threshold (%)", value=10.0, min_value=1.0, max_value=30.0) / 100
+            short_threshold = col2.number_input("Short threshold (%)", value=15.0, min_value=1.0, max_value=30.0) / 100
+            
+            col3, col4 = st.columns(2)
+            min_data_points = col3.number_input("Min data points", value=100, min_value=50, max_value=500)
+            n_splits = col4.number_input("Cross-validation splits", value=10, min_value=5, max_value=20)
+            
+            agent = StatisticalMeanAgent(
+                long_threshold=long_threshold,
+                short_threshold=short_threshold,
+                min_data_points=min_data_points,
+                n_splits=n_splits
+            )
+            
+            # Statistical agents need sufficient data
+            if len(df) < min_data_points:
+                st.warning(f"Need at least {min_data_points} data points. Current: {len(df)}")
+                
+        elif agent_choice == "Enhanced Statistical":
+            st.markdown("**Enhanced Statistical Parameters**")
+            col1, col2 = st.columns(2)
+            long_threshold = col1.number_input("Long threshold (%)", value=10.0, min_value=1.0, max_value=30.0) / 100
+            short_threshold = col2.number_input("Short threshold (%)", value=15.0, min_value=1.0, max_value=30.0) / 100
+            
+            col3, col4 = st.columns(2)
+            min_data_points = col3.number_input("Min data points", value=100, min_value=50, max_value=500)
+            n_splits = col4.number_input("Cross-validation splits", value=10, min_value=5, max_value=20)
+            
+            col5, col6 = st.columns(2)
+            volatility_filter = col5.checkbox("Volatility filter", value=True)
+            trend_confirmation = col6.checkbox("Trend confirmation", value=True)
+            
+            agent = EnhancedStatisticalAgent(
+                long_threshold=long_threshold,
+                short_threshold=short_threshold,
+                min_data_points=min_data_points,
+                n_splits=n_splits,
+                volatility_filter=volatility_filter,
+                trend_confirmation=trend_confirmation
+            )
+            
+            if len(df) < min_data_points:
+                st.warning(f"Need at least {min_data_points} data points. Current: {len(df)}")
 
-        if st.button("Run simulation"):
+        run_disabled = (
+            (agent_choice == "LSTM-SMA" and not st.session_state.lstm_trained) or
+            (agent_choice in ["Statistical Mean", "Enhanced Statistical"] and len(df) < min_data_points)
+        )
+        
+        if st.button("Run simulation", disabled=run_disabled):
             if agent_choice == "LSTM-SMA" and not st.session_state.lstm_trained:
                 st.error("LSTM model must be trained first!")
+            elif agent_choice in ["Statistical Mean", "Enhanced Statistical"] and len(df) < min_data_points:
+                st.error(f"Need at least {min_data_points} data points for statistical agents!")
             else:
                 self._run_simulation(env, agent)
     
@@ -267,16 +324,16 @@ class StockRLDashboard:
         
         with tab1:
             st.plotly_chart(
-                plot_portfolio_history(results['env_history']), 
+                plot_portfolio_history(results['env_history'], st.session_state.df), 
                 use_container_width=True
             )
-        
+
         with tab2:
             st.plotly_chart(
                 plot_trades_on_price(st.session_state.df, results['env_history']), 
                 use_container_width=True
             )
-        
+
         with tab3:
             st.subheader("Risk/Reward Analysis")
             col1, col2 = st.columns(2)
