@@ -1,4 +1,3 @@
-# src/viz/plots.py
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
@@ -12,15 +11,22 @@ def _flatten_series_or_df(y):
         return y.ravel()
     return y
 
-def plot_price(df: pd.DataFrame, title: str = "Price"):
-    # Determine x-axis
+def _get_dates_from_df(df: pd.DataFrame):
+    """Extract dates from DataFrame with proper handling"""
     if 'Date' in df.columns:
-        x = df['Date']
+        return pd.to_datetime(df['Date'])
     elif 'date' in df.columns:
-        x = df['date']
+        return pd.to_datetime(df['date'])
+    elif df.index.name == 'Date' or df.index.name == 'date':
+        return pd.to_datetime(df.index)
     else:
-        x = df.index
+        # Create sequential business days if no dates available
+        return pd.date_range(start='2020-01-01', periods=len(df), freq='B')
 
+def plot_price(df: pd.DataFrame, title: str = "Price"):
+    """Plot price with proper date handling"""
+    dates = _get_dates_from_df(df)
+    
     # Determine y-axis and flatten
     if 'Close' in df.columns:
         y = df['Close']
@@ -28,37 +34,118 @@ def plot_price(df: pd.DataFrame, title: str = "Price"):
         y = df.get('price', df.iloc[:, -1])
     y = _flatten_series_or_df(y)
 
-    fig = px.line(x=x, y=y, labels={'x': 'Date', 'y': 'Price'}, title=title)
+    # Use graph_objects for consistent API
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates, 
+        y=y, 
+        mode='lines', 
+        name='Price',
+        line=dict(color='blue')
+    ))
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title='Date',
+        yaxis_title='Price ($)',
+        hovermode='x unified'
+    )
     return fig
 
-def plot_portfolio_history(history: dict, title: str = "Portfolio Value"):
-    steps = history.get('step', list(range(len(history.get('portfolio_valuation', [])))))
-    vals = _flatten_series_or_df(history.get('portfolio_valuation', []))
+def plot_portfolio_history(history: dict, price_df: pd.DataFrame, title: str = "Portfolio Value"):
+    """Plot portfolio value with correct dates aligned to price data"""
+    if not history or 'portfolio_valuation' not in history:
+        return go.Figure()
+    
+    # Get dates from price data
+    dates = _get_dates_from_df(price_df)
+    
+    # Ensure we don't exceed available dates
+    min_length = min(len(history['portfolio_valuation']), len(dates))
+    portfolio_values = history['portfolio_valuation'][:min_length]
+    valid_dates = dates[:min_length]
+    
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=steps, y=vals, mode='lines+markers', name='Portfolio'))
-    fig.update_layout(title=title, xaxis_title='Step', yaxis_title='Value')
+    fig.add_trace(go.Scatter(
+        x=valid_dates, 
+        y=portfolio_values, 
+        mode='lines', 
+        name='Portfolio',
+        line=dict(color='green', width=2)
+    ))
+    
+    fig.update_layout(
+        title=title, 
+        xaxis_title='Date', 
+        yaxis_title='Value ($)',
+        hovermode='x unified'
+    )
     return fig
 
 def plot_trades_on_price(df: pd.DataFrame, history: dict, title="Trades"):
-    fig = plot_price(df, title=title)
-    if history:
-        steps = history.get('step', [])
-        prices = _flatten_series_or_df(history.get('price', []))
-        positions = history.get('position', [])
+    """Plot trades on price chart with correct date alignment"""
+    # Create base price plot using graph_objects
+    dates = _get_dates_from_df(df)
+    
+    if 'Close' in df.columns:
+        y = df['Close']
+    else:
+        y = df.get('price', df.iloc[:, -1])
+    y = _flatten_series_or_df(y)
 
-        buys_x = [steps[i] for i in range(len(positions)) if positions[i] == 1]
-        buys_y = [prices[i] for i in range(len(positions)) if positions[i] == 1]
-        sells_x = [steps[i] for i in range(len(positions)) if positions[i] == -1]
-        sells_y = [prices[i] for i in range(len(positions)) if positions[i] == -1]
-
-        if buys_x:
-            fig.add_trace(go.Scatter(
-                x=buys_x, y=buys_y, mode='markers',
-                marker_symbol='triangle-up', name='Long', marker=dict(size=10)
-            ))
-        if sells_x:
-            fig.add_trace(go.Scatter(
-                x=sells_x, y=sells_y, mode='markers',
-                marker_symbol='triangle-down', name='Short', marker=dict(size=10)
-            ))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates, 
+        y=y, 
+        mode='lines', 
+        name='Price',
+        line=dict(color='blue')
+    ))
+    
+    if not history or 'position' not in history or 'price' not in history:
+        fig.update_layout(title=title, xaxis_title='Date', yaxis_title='Price ($)')
+        return fig
+    
+    # Ensure we don't exceed available data
+    min_length = min(len(history['position']), len(dates), len(history['price']))
+    positions = history['position'][:min_length]
+    prices = history['price'][:min_length]
+    valid_dates = dates[:min_length]
+    
+    # Find trade entry points (where position changes)
+    buy_dates, buy_prices = [], []
+    sell_dates, sell_prices = [], []
+    
+    for i in range(1, min_length):
+        if positions[i] != positions[i-1]:  # Position changed
+            if positions[i] == 1:  # Entered long
+                buy_dates.append(valid_dates[i])
+                buy_prices.append(prices[i])
+            elif positions[i] == -1:  # Entered short
+                sell_dates.append(valid_dates[i])
+                sell_prices.append(prices[i])
+    
+    # Add trade markers
+    if buy_dates:
+        fig.add_trace(go.Scatter(
+            x=buy_dates, y=buy_prices, mode='markers',
+            marker_symbol='triangle-up', marker_size=12,
+            marker_color='green', name='Buy Entry',
+            hovertemplate='Buy: %{y:.2f}<br>Date: %{x|%Y-%m-%d}<extra></extra>'
+        ))
+    
+    if sell_dates:
+        fig.add_trace(go.Scatter(
+            x=sell_dates, y=sell_prices, mode='markers',
+            marker_symbol='triangle-down', marker_size=12,
+            marker_color='red', name='Sell Entry',
+            hovertemplate='Sell: %{y:.2f}<br>Date: %{x|%Y-%m-%d}<extra></extra>'
+        ))
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title='Date',
+        yaxis_title='Price ($)',
+        hovermode='x unified'
+    )
     return fig
