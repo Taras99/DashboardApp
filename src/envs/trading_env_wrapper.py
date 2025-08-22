@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any, Tuple
 import pandas as pd
 import numpy as np
 import warnings
-
+import datetime
 try:
     from gym_trading_env.environments import TradingEnv
     _HAS_EXTERNAL_ENV = True
@@ -204,75 +204,204 @@ def create_trading_env_from_df(
         return SimpleTradingEnv(df=df, initial_balance=initial_balance, trading_fees=trading_fees)
     
 
-class EnhancedTradingEnv(SimpleTradingEnv):
+class AdvancedTradingEnv:
+    """
+    Advanced trading environment with better portfolio management and realistic trading mechanics.
+    """
     def __init__(self, df: pd.DataFrame, initial_balance: float = 10000.0, 
-                 trading_fees: float = 0.001, max_position_pct: float = 0.1):
-        super().__init__(df, initial_balance, trading_fees)
-        self.max_position_pct = max_position_pct  # Max % of capital per trade
-        self.drawdown_threshold = 0.2  # Max allowed drawdown
-        self.peak_balance = initial_balance
+                 trading_fees: float = 0.001, max_position_pct: float = 0.1,
+                 allow_shorting: bool = False, interest_rate: float = 0.0003):
+        
+        self.df = df.copy()
+        self._validate_dataframe()
+        self.initial_balance = initial_balance
+        self.trading_fees = trading_fees
+        self.max_position_pct = max_position_pct
+        self.allow_shorting = allow_shorting
+        self.interest_rate = interest_rate
+        self.reset()
 
-    def step(self, action: int) -> Tuple[Dict[str, float], float, bool, Dict[str, Any]]:
+    def _validate_dataframe(self):
+        """Ensure DataFrame has required structure."""
+        required_columns = ['Close', 'Open', 'High', 'Low']
+        for col in required_columns:
+            if col not in self.df.columns:
+                raise ValueError(f"DataFrame must contain '{col}' column")
+        if len(self.df) < 2:
+            raise ValueError("DataFrame must contain at least 2 rows")
+
+    def _get_price(self, idx: int, price_type: str = 'Close') -> float:
+        """Safely extract price from DataFrame row."""
+        try:
+            price_data = self.df.iloc[idx][price_type]
+            if isinstance(price_data, pd.Series):
+                return float(price_data.iloc[0])
+            return float(price_data)
+        except (KeyError, IndexError, ValueError):
+            return float(self.df.iloc[idx]['Close'])
+
+    def _get_current_date(self) -> datetime:
+        """Get current date from DataFrame."""
+        if 'Date' in self.df.columns:
+            return pd.to_datetime(self.df.iloc[self.step_idx]['Date'])
+        elif self.df.index.name == 'Date':
+            return pd.to_datetime(self.df.index[self.step_idx])
+        else:
+            return datetime.now()
+
+    def reset(self):
+        """Reset environment to initial state."""
+        self.step_idx = 0
+        self.position = 0  # -1: short, 0: neutral, 1: long
+        self.balance = self.initial_balance  # CASH balance
+        self.shares_held = 0.0  # NUMBER of shares currently held
+        self.entry_price = 0.0  # Average entry price
+        self.peak_balance = self.initial_balance
+        self.total_trades = 0
+        self.total_commission = 0.0
+        
+        self.history = {
+            'step': [], 
+            'date': [],
+            'price': [], 
+            'position': [], 
+            'portfolio_valuation': [],
+            'cash_balance': [],
+            'stock_value': [],
+            'shares_held': [],
+            'action_taken': []
+        }
+        return self._obs()
+
+    def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+        """Execute one environment step with proper portfolio tracking."""
         try:
             if self.step_idx >= len(self.df) - 1:
-                return self._obs(), 0.0, True, {'portfolio_valuation': self.balance}
+                final_obs = self._obs()
+                return final_obs, 0.0, True, {'portfolio_valuation': final_obs['portfolio_value']}
+
+            current_price = self._get_price(self.step_idx)
             
-            price = self._get_price(self.step_idx)
-            prev_portfolio_val = self.balance + (self.shares * price * self.position if self.position != 0 else 0)
+            # Store previous portfolio value for reward calculation
+            prev_portfolio_val = self._calculate_portfolio_value(current_price)
             
-            # Handle position changes with risk management
+            # Handle position changes
+            position_changed = False
             if action != self.position:
-                # Close existing position
-                if self.position != 0:
-                    pnl = (price - self.entry_price) * self.position * self.shares
-                    self.balance += pnl
-                    self.shares = 0.0
+                position_changed = True
+                self.total_trades += 1
                 
-                # Open new position with position sizing
+                # CLOSE EXISTING POSITION (sell stocks)
+                if self.position != 0:
+                    if self.position == 1:  # Close long position (sell stocks)
+                        # Calculate profit from selling
+                        sale_value = self.shares_held * current_price
+                        fees = self._apply_trading_fees(sale_value)
+                        self.balance += sale_value - fees  # Add cash from sale
+                        self.shares_held = 0.0
+                        
+                    elif self.position == -1:  # Close short position (buy back)
+                        # Calculate cost to buy back shares
+                        buy_cost = self.shares_held * current_price
+                        fees = self._apply_trading_fees(buy_cost)
+                        self.balance -= (buy_cost + fees)  # Subtract cash to buy back
+                        self.shares_held = 0.0
+                    
+                    self.entry_price = 0.0
+
+                # OPEN NEW POSITION (buy stocks)
                 if action != 0:
                     max_invest = self.balance * self.max_position_pct
-                    self.shares = max_invest / price
-                    self.entry_price = price
-                    self.balance -= max_invest * self.trading_fees
+                    
+                    if action == 1:  # Open long position (buy stocks)
+                        self.shares_held = max_invest / current_price
+                        fees = self._apply_trading_fees(max_invest)
+                        self.balance -= (max_invest + fees)  # Subtract cash spent
+                        self.entry_price = current_price
+                        
+                    elif action == -1 and self.allow_shorting:  # Open short position
+                        # For shorting, we borrow shares and sell them
+                        self.shares_held = max_invest / current_price
+                        short_proceeds = self.shares_held * current_price
+                        fees = self._apply_trading_fees(short_proceeds)
+                        self.balance += (short_proceeds - fees)  # Add cash from short sale
+                        self.entry_price = current_price
+                        
+                    else:  # Invalid short position when not allowed
+                        action = 0
+                        self.shares_held = 0.0
                 
                 self.position = action
+
+            # Calculate CURRENT portfolio value (cash + stock value)
+            portfolio_val = self._calculate_portfolio_value(current_price)
             
-            # Calculate new portfolio value
-            portfolio_val = self.balance + (self.shares * price * self.position if self.position != 0 else 0)
+            # Update peak balance
             self.peak_balance = max(self.peak_balance, portfolio_val)
             
-            # Calculate drawdown
-            current_drawdown = (self.peak_balance - portfolio_val) / self.peak_balance
-            if current_drawdown >= self.drawdown_threshold:
-                return self._obs(), -100.0, True, {'portfolio_valuation': portfolio_val, 'termination': 'drawdown'}
+            # Update history with ACTUAL values
+            current_date = self._get_current_date()
+            stock_value = self.shares_held * current_price * (1 if self.position == 1 else -1 if self.position == -1 else 0)
             
-            # Update history
             self.history['step'].append(self.step_idx)
-            self.history['price'].append(price)
+            self.history['date'].append(current_date)
+            self.history['price'].append(current_price)
             self.history['position'].append(self.position)
             self.history['portfolio_valuation'].append(portfolio_val)
-            
+            self.history['cash_balance'].append(self.balance)
+            self.history['stock_value'].append(stock_value)
+            self.history['shares_held'].append(self.shares_held)
+            self.history['action_taken'].append(action if position_changed else 0)
+
+            # Move to next step
             self.step_idx += 1
             done = self.step_idx >= len(self.df) - 1
             
-            # Risk-adjusted reward calculation
+            # Calculate reward based on actual portfolio change
             reward = self._calculate_reward(prev_portfolio_val, portfolio_val)
             
-            return self._obs(), reward, done, {'portfolio_valuation': portfolio_val}
+            info = {
+                'portfolio_valuation': portfolio_val,
+                'cash_balance': self.balance,
+                'shares_held': self.shares_held,
+                'stock_value': stock_value,
+                'current_price': current_price,
+                'position': self.position
+            }
+            
+            return self._obs(), reward, done, info
             
         except Exception as e:
+            print(f"Error in step(): {str(e)}")
             return self._obs(), 0.0, True, {'error': str(e)}
 
-    def _calculate_reward(self, prev_val: float, current_val: float) -> float:
-        """Calculate risk-adjusted reward"""
-        raw_return = (current_val - prev_val) / prev_val if prev_val != 0 else 0
+    def _calculate_portfolio_value(self, current_price: float) -> float:
+        """Calculate actual portfolio value: CASH + STOCK_VALUE."""
+        if self.position == 1:  # Long
+            stock_value = self.shares_held * current_price
+            return self.balance + stock_value
+            
+        elif self.position == -1:  # Short  
+            # For short positions, we owe shares so stock value is negative
+            stock_value = self.shares_held * current_price * -1
+            return self.balance + stock_value
+            
+        else:  # Neutral
+            return self.balance
+
+    def _obs(self) -> Dict[str, Any]:
+        """Generate observation with actual portfolio breakdown."""
+        current_price = self._get_price(self.step_idx)
+        portfolio_val = self._calculate_portfolio_value(current_price)
         
-        # Add penalty for large positions
-        position_penalty = abs(self.position) * 0.01  # 1% penalty per position unit
-        
-        # Add volatility component
-        price_changes = np.diff([x for x in self.history['price'][-10:] if x is not None])
-        volatility = np.std(price_changes) if len(price_changes) > 1 else 0
-        volatility_penalty = volatility * 0.5
-        
-        return raw_return - position_penalty - volatility_penalty
+        return {
+            'price': current_price,
+            'position': float(self.position),
+            'cash': float(self.balance),
+            'shares_held': float(self.shares_held),
+            'stock_value': float(portfolio_val - self.balance),
+            'portfolio_value': float(portfolio_val),
+            'entry_price': float(self.entry_price),
+            'step': self.step_idx,
+            'date': self._get_current_date()
+        }
