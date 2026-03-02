@@ -6,6 +6,51 @@ from typing import Optional, Dict, List
 import numpy as np
 
 
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a DataFrame from yfinance into a flat, consistent format.
+
+    - Flattens MultiIndex columns (e.g. ('Close', 'AAPL') -> 'Close')
+    - Ensures a 'Date' column exists (from index or column)
+    - Standardizes column names to Open, High, Low, Close, Volume
+    """
+    df = df.copy()
+
+    # 1. Flatten MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
+
+    # 2. Ensure Date column exists
+    if 'Date' not in df.columns and 'date' not in df.columns:
+        if df.index.name in ('Date', 'date'):
+            df = df.reset_index()
+        elif hasattr(df.index, 'dtype') and pd.api.types.is_datetime64_any_dtype(df.index):
+            df.index.name = 'Date'
+            df = df.reset_index()
+        # Handle 'index' column that may come from a prior reset_index()
+        if 'index' in df.columns and pd.api.types.is_datetime64_any_dtype(df['index']):
+            df = df.rename(columns={'index': 'Date'})
+
+    # Normalize 'date' -> 'Date'
+    if 'date' in df.columns and 'Date' not in df.columns:
+        df = df.rename(columns={'date': 'Date'})
+
+    # 3. Standardize column names
+    canonical = {'open': 'Open', 'high': 'High', 'low': 'Low',
+                 'close': 'Close', 'volume': 'Volume', 'date': 'Date'}
+    rename_map = {}
+    for col in df.columns:
+        lower = col.lower()
+        if lower in canonical and col != canonical[lower]:
+            rename_map[col] = canonical[lower]
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Remove duplicate columns that may result from flattening
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    return df
+
+
 class ITickerProvider(ABC):
     """Interface for ticker providers"""
     @abstractmethod
@@ -98,8 +143,8 @@ class YahooFinanceDataProvider(IStockDataProvider):
             
             if df.empty:
                 raise ValueError(f"No data for {ticker} with period={period} interval={interval}")
-            
-            return df.reset_index()
+
+            return normalize_dataframe(df.reset_index())
         
         except Exception as e:
             raise ValueError(f"Failed to download data: {str(e)}")
