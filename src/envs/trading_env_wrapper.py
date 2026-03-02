@@ -1,9 +1,8 @@
 # src/envs/trading_env_wrapper.py
-from typing import Optional, Dict, Any, Tuple, Union, List
+from typing import Optional, Dict, Any, Tuple, Union
 import pandas as pd
 import numpy as np
 import warnings
-import datetime
 from datetime import datetime as dt
 try:
     from gym_trading_env.environments import TradingEnv
@@ -26,48 +25,32 @@ class SimpleTradingEnv:
         self.reset()
 
     def _validate_dataframe(self):
-        """Ensure DataFrame has required structure."""
-        if not any('close' in col.lower() or 'Close' in col for col in self._get_column_names()):
+        """Ensure DataFrame has required structure (assumes flat, normalized columns)."""
+        if 'Close' not in self.df.columns:
             raise ValueError("DataFrame must contain 'Close' column")
         if len(self.df) < 2:
             raise ValueError("DataFrame must contain at least 2 rows")
 
-    def _get_column_names(self) -> List[str]:
-        """Get column names accounting for MultiIndex"""
-        if isinstance(self.df.columns, pd.MultiIndex):
-            return [col[0] for col in self.df.columns]
-        return self.df.columns.tolist()
-
     def _get_price(self, idx: int, price_type: str = 'Close') -> float:
-        """Safely extract price from DataFrame row."""
+        """Extract price from DataFrame row (assumes flat, normalized columns)."""
         try:
-            # Try to find the column case-insensitively
-            col_names = self._get_column_names()
-            close_cols = [col for col in col_names if price_type.lower() in col.lower()]
-            
-            if not close_cols:
-                # Fallback to any column with price data
-                price_cols = [col for col in col_names if any(x in col.lower() for x in ['close', 'price', 'last'])]
-                if not price_cols:
-                    raise ValueError(f"No {price_type} column found")
-                target_col = price_cols[0]
-            else:
-                target_col = close_cols[0]
-            
-            # Get the actual column name (for MultiIndex)
-            if isinstance(self.df.columns, pd.MultiIndex):
-                actual_col = [col for col in self.df.columns if col[0] == target_col][0]
-            else:
-                actual_col = target_col
-            
-            price_data = self.df.iloc[idx][actual_col]
-            
-            if isinstance(price_data, pd.Series):
-                return float(price_data.iloc[0])
-            return float(price_data)
-            
-        except (KeyError, IndexError, ValueError) as e:
+            return float(self.df.iloc[idx][price_type])
+        except (KeyError, IndexError) as e:
             raise ValueError(f"Error getting price at index {idx}: {str(e)}")
+
+    def _get_current_date(self):
+        """Get current date from DataFrame."""
+        try:
+            if 'Date' in self.df.columns:
+                return pd.to_datetime(self.df.iloc[self.step_idx]['Date'])
+            elif 'date' in self.df.columns:
+                return pd.to_datetime(self.df.iloc[self.step_idx]['date'])
+            elif hasattr(self.df.index, 'dtype') and pd.api.types.is_datetime64_any_dtype(self.df.index):
+                return pd.to_datetime(self.df.index[self.step_idx])
+            else:
+                return dt.now()
+        except Exception:
+            return dt.now()
 
     def reset(self) -> Dict[str, float]:
         """Reset environment to initial state."""
@@ -77,9 +60,10 @@ class SimpleTradingEnv:
         self.shares = 0.0
         self.entry_price = 0.0
         self.history = {
-            'step': [], 
-            'price': [], 
-            'position': [], 
+            'step': [],
+            'date': [],
+            'price': [],
+            'position': [],
             'portfolio_valuation': [],
             'action_taken': [],
             'cash_balance': [],
@@ -180,6 +164,7 @@ class SimpleTradingEnv:
             
             # Update history - CRITICAL: Update history BEFORE moving to next step
             self.history['step'].append(self.step_idx)
+            self.history['date'].append(self._get_current_date())
             self.history['price'].append(current_price)
             self.history['position'].append(self.position)
             self.history['portfolio_valuation'].append(portfolio_val)
@@ -334,27 +319,11 @@ class AdvancedTradingEnv(SimpleTradingEnv):
         
         # Enhanced history tracking
         self.history.update({
-            'date': [],
             'stock_value': [],
             'max_drawdown': [],
             'daily_return': []
         })
         return self._obs()
-
-    def _get_current_date(self) -> datetime:
-        """Get current date from DataFrame."""
-        try:
-            if 'date' in self.df.columns or 'Date' in self.df.columns:
-                date_col = 'date' if 'date' in self.df.columns else 'Date'
-                return pd.to_datetime(self.df.iloc[self.step_idx][date_col])
-            elif hasattr(self.df.index, 'name') and self.df.index.name in ['date', 'Date']:
-                return pd.to_datetime(self.df.index[self.step_idx])
-            elif hasattr(self.df.index, 'dtype') and pd.api.types.is_datetime64_any_dtype(self.df.index):
-                return pd.to_datetime(self.df.index[self.step_idx])
-            else:
-                return dt.now()
-        except:
-            return dt.now()
 
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """Execute one environment step with proper portfolio tracking."""
