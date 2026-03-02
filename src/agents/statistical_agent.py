@@ -1,392 +1,127 @@
+# src/agents/statistical_agent.py   
 from .base import BaseAgent
-from typing import List, Tuple
+from typing import List
 import pandas as pd
 import numpy as np
-from collections import deque
-from datetime import datetime, timedelta
 
 class StatisticalMeanAgent(BaseAgent):
     def __init__(self, 
-                 long_threshold: float = 0.10,    # 10% below mean for long
-                 short_threshold: float = 0.15,   # 15% above mean for short  
-                 min_data_points: int = 100,      # Minimum data to start trading
-                 n_splits: int = 10,             # Number of cross-validation splits
-                 trading_frequency: str = '1W'):  # Trading frequency: '1W', '2W', '1M'
+                 long_threshold: float = 0.07,    # 7% below mean for buy
+                 short_threshold: float = 0.07,   # 7% above mean for sell
+                 min_data_points: int = 20,       # Faster startup
+                 n_splits: int = 5,              # Faster calculation
+                 position_size: float = 0.3,      # 30% of cash per trade
+                 min_trade_amount: float = 100.0): # Minimum trade size
         
         self.long_threshold = long_threshold
         self.short_threshold = short_threshold
         self.min_data_points = min_data_points
         self.n_splits = n_splits
-        self.trading_frequency = trading_frequency
+        self.position_size = position_size
+        self.min_trade_amount = min_trade_amount
         
         self.price_history = []
-        self.current_position = 0
-        self.entry_price = 0
-        self.entry_prices = []  # Track multiple entry points
-        self.shares_held = 0
-        self.cross_val_means = []
-        self.last_trade_date = None
-        self.available_cash = 10000.0  # Starting cash
+        self.shares_held = 0.0
+        self.entry_prices = []
+        self.available_cash = 10000.0
         self.total_invested = 0.0
+        self.cross_val_means = []
+        self.last_action = 0
+        self.current_position = 0  # 0: neutral, 1: long, -1: short
         
     def reset(self):
         """Reset agent state"""
         self.price_history = []
-        self.current_position = 0
-        self.entry_price = 0
+        self.shares_held = 0.0
         self.entry_prices = []
-        self.shares_held = 0
-        self.cross_val_means = []
-        self.last_trade_date = None
         self.available_cash = 10000.0
         self.total_invested = 0.0
+        self.cross_val_means = []
+        self.last_action = 0
+        self.current_position = 0
         
-    def _calculate_cross_val_means(self, data: List[float]) -> List[float]:
-        """Calculate means for n equal parts of the dataset"""
-        if len(data) < self.min_data_points:
+    def set_initial_balance(self, initial_balance: float):
+        """Set initial balance"""
+        self.available_cash = initial_balance
+        
+    def _calculate_cross_val_means(self) -> List[float]:
+        """Calculate rolling means for recent data"""
+        if len(self.price_history) < self.min_data_points:
             return []
             
-        # Split data into n equal parts
-        split_size = len(data) // self.n_splits
+        # Use recent data for means calculation
+        recent_data = self.price_history[-self.min_data_points:]
+        split_size = len(recent_data) // self.n_splits
         means = []
         
         for i in range(self.n_splits):
             start_idx = i * split_size
             end_idx = start_idx + split_size
-            if end_idx > len(data):
-                end_idx = len(data)
-                
-            split_data = data[start_idx:end_idx]
-            if split_data:  # Ensure we have data in this split
+            split_data = recent_data[start_idx:end_idx]
+            if split_data:
                 means.append(np.mean(split_data))
                 
-        return means
+        return means if means else [np.mean(recent_data)]
         
     def _get_current_mean(self) -> float:
-        """Get weighted mean of cross-validation means"""
+        """Get current mean value"""
         if not self.cross_val_means:
             return 0
-            
-        # Recent splits get higher weight
-        weights = np.linspace(0.5, 1.5, len(self.cross_val_means))
-        weighted_mean = np.average(self.cross_val_means, weights=weights)
-        return weighted_mean
+        return np.mean(self.cross_val_means)
         
-    def _calculate_trading_signals(self, current_price: float, current_date: datetime) -> dict:
-        """Calculate trading signals with frequency control"""
+    def _calculate_trading_signals(self, current_price: float) -> dict:
+        """Calculate both buy and sell signals continuously"""
         if not self.cross_val_means:
             return {'buy': False, 'sell': False, 'hold': True}
             
         current_mean = self._get_current_mean()
-        
-        # Check if we should trade based on frequency
-        should_trade = self._should_trade_today(current_date)
-        
+        if current_mean == 0:
+            return {'buy': False, 'sell': False, 'hold': True}
+            
+        price_ratio = current_price / current_mean
         signals = {
             'buy': False,
-            'sell': False, 
+            'sell': False,
             'hold': True,
             'current_price': current_price,
             'current_mean': current_mean,
-            'deviation_pct': (current_price - current_mean) / current_mean * 100,
-            'should_trade': should_trade
+            'deviation_pct': (price_ratio - 1) * 100
         }
         
-        # Only generate signals on trading days
-        if not should_trade:
-            return signals
-            
-        # Buy signal: price is significantly below mean AND we have cash
-        if (current_price <= current_mean * (1 - self.long_threshold) and 
-            self.available_cash > current_price):
+        # BUY signal: price significantly below mean AND we have cash
+        if (price_ratio <= (1 - self.long_threshold) and 
+            self.available_cash >= self.min_trade_amount):
             signals['buy'] = True
             signals['hold'] = False
             
-        # NEVER SELL - Only buy more when prices are low
-        # We hold through downturns and only add more positions
-        
+        # SELL signal: price significantly above mean AND we have shares
+        elif (price_ratio >= (1 + self.short_threshold) and 
+              self.shares_held > 0 and self.current_position == 1):
+            signals['sell'] = True
+            signals['hold'] = False
+            
         return signals
         
-    def _should_trade_today(self, current_date: datetime) -> bool:
-        """Check if today is a trading day based on frequency"""
-        if self.last_trade_date is None:
-            return True
+    def _calculate_position_size(self, current_price: float, signal_type: str) -> float:
+        """Calculate how many shares to buy/sell"""
+        if signal_type == 'buy':
+            if self.available_cash < self.min_trade_amount:
+                return 0
+            investment = min(self.available_cash * self.position_size, self.available_cash)
+            return investment / current_price
             
-        if self.trading_frequency == '1W':
-            return (current_date - self.last_trade_date).days >= 7
-        elif self.trading_frequency == '2W':
-            return (current_date - self.last_trade_date).days >= 14
-        elif self.trading_frequency == '1M':
-            return (current_date - self.last_trade_date).days >= 30
-        else:
-            return True  # Daily trading by default
+        elif signal_type == 'sell':
+            if self.shares_held <= 0:
+                return 0
+            # Sell all shares for now
+            return self.shares_held
             
-    def _extract_price_and_date(self, observation: dict) -> Tuple[float, datetime]:
-        """Extract both price and date from observation"""
-        try:
-            price = None
-            date = datetime.now()  # Default to current date
-            
-            # Extract price
-            price_data = observation.get('price')
-            if isinstance(price_data, (float, int)):
-                price = float(price_data)
-            elif isinstance(price_data, pd.Series):
-                price = float(price_data.iloc[-1])
-            elif isinstance(price_data, np.ndarray):
-                price = float(price_data.item()) if price_data.size == 1 else float(price_data[-1])
-            else:
-                price = float(price_data)
-                
-            # Extract date if available
-            if 'date' in observation:
-                date = pd.to_datetime(observation['date'])
-            elif 'Date' in observation:
-                date = pd.to_datetime(observation['Date'])
-                
-            return price, date
-            
-        except (KeyError, ValueError, TypeError):
-            return None, datetime.now()
+        return 0
         
     def act(self, observation: dict) -> int:
         """
-        Generate trading action - Only buy, never sell
-        Returns: 1 (buy), 0 (hold), -1 is disabled
-        """
-        price, current_date = self._extract_price_and_date(observation)
-        if price is None:
-            return 0
-            
-        # Add to price history
-        self.price_history.append(price)
-        
-        # Wait for sufficient data
-        if len(self.price_history) < self.min_data_points:
-            return 0
-            
-        # Update cross-validation means periodically
-        if len(self.price_history) % 50 == 0:  # Update every 50 steps
-            self.cross_val_means = self._calculate_cross_val_means(self.price_history)
-            
-        # Calculate trading signals
-        signals = self._calculate_trading_signals(price, current_date)
-        
-        # Execute BUY only (never sell)
-        if signals['buy'] and signals['should_trade']:
-            # Calculate how many shares to buy (use 20% of available cash)
-            investment_amount = min(self.available_cash * 0.2, self.available_cash)
-            shares_to_buy = investment_amount / price
-            
-            if shares_to_buy > 0:
-                self.shares_held += shares_to_buy
-                self.entry_prices.append(price)
-                self.available_cash -= investment_amount
-                self.total_invested += investment_amount
-                self.last_trade_date = current_date
-                self.current_position = 1  # Always long
-                return 1  # Buy signal
-                
-        return 0  # Hold - never sell
-        
-    def get_portfolio_value(self, current_price: float) -> float:
-        """Calculate current portfolio value"""
-        stock_value = self.shares_held * current_price
-        return stock_value + self.available_cash
-        
-    def get_average_entry_price(self) -> float:
-        """Calculate average entry price across all purchases"""
-        if not self.entry_prices:
-            return 0
-        return sum(self.entry_prices) / len(self.entry_prices)
-        
-    def get_performance_stats(self, current_price: float) -> dict:
-        """Get performance statistics"""
-        total_value = self.get_portfolio_value(current_price)
-        avg_entry = self.get_average_entry_price()
-        
-        return {
-            'total_value': total_value,
-            'available_cash': self.available_cash,
-            'shares_held': self.shares_held,
-            'total_invested': self.total_invested,
-            'average_entry_price': avg_entry,
-            'current_unrealized_pnl': (current_price - avg_entry) * self.shares_held if avg_entry > 0 else 0,
-            'current_price': current_price
-        }
-
-
-class EnhancedStatisticalAgent(StatisticalMeanAgent):
-    def __init__(self, 
-                 long_threshold: float = 0.10,
-                 short_threshold: float = 0.15,
-                 min_data_points: int = 100,
-                 n_splits: int = 10,
-                 trading_frequency: str = '1W',
-                 volatility_filter: bool = True,
-                 max_cash_usage: float = 0.2):  # Max 20% of cash per trade
-        
-        super().__init__(long_threshold, short_threshold, min_data_points, n_splits, trading_frequency)
-        
-        self.volatility_filter = volatility_filter
-        self.max_cash_usage = max_cash_usage
-        self.volatility_history = deque(maxlen=50)
-        
-    def _calculate_volatility(self) -> float:
-        """Calculate recent volatility"""
-        if len(self.price_history) < 2:
-            return 0
-            
-        returns = np.diff(self.price_history[-50:]) / np.array(self.price_history[-51:-1])
-        return np.std(returns) if len(returns) > 0 else 0
-        
-    def _calculate_trading_signals(self, current_price: float, current_date: datetime) -> dict:
-        """Enhanced signals with volatility filtering"""
-        signals = super()._calculate_trading_signals(current_price, current_date)
-        
-        if self.volatility_filter and signals['buy']:
-            volatility = self._calculate_volatility()
-            # Avoid buying during extremely high volatility
-            if volatility > 0.08:  # 8% daily volatility threshold
-                signals['buy'] = False
-                signals['hold'] = True
-                
-        return signals
-        
-    def act(self, observation: dict) -> int:
-        price, current_date = self._extract_price_and_date(observation)
-        if price is None:
-            return 0
-            
-        self.price_history.append(price)
-        
-        if len(self.price_history) < self.min_data_points:
-            return 0
-            
-        if len(self.price_history) % 50 == 0:
-            self.cross_val_means = self._calculate_cross_val_means(self.price_history)
-            
-        signals = self._calculate_trading_signals(price, current_date)
-        
-        # Enhanced buy logic with cash management
-        if signals['buy'] and signals['should_trade']:
-            # Use smaller position size during high volatility
-            volatility = self._calculate_volatility()
-            cash_percentage = self.max_cash_usage
-            
-            if volatility > 0.05:  # Reduce position size in high vol
-                cash_percentage *= 0.5
-                
-            investment_amount = min(self.available_cash * cash_percentage, self.available_cash)
-            shares_to_buy = investment_amount / price
-            
-            if shares_to_buy > 0:
-                self.shares_held += shares_to_buy
-                self.entry_prices.append(price)
-                self.available_cash -= investment_amount
-                self.total_invested += investment_amount
-                self.last_trade_date = current_date
-                self.current_position = 1
-                return 1  # Buy
-                
-        return 0  # Hold - never sell
-    
-from .base import BaseAgent
-from typing import List, Tuple
-import pandas as pd
-import numpy as np
-from collections import deque
-from datetime import datetime, timedelta
-
-class StatisticalMeanAgent(BaseAgent):
-    def __init__(self, 
-                 long_threshold: float = 0.10,    # 10% below mean for long
-                 min_data_points: int = 100,      # Minimum data to start trading
-                 n_splits: int = 10):             # Number of cross-validation splits
-        
-        self.long_threshold = long_threshold
-        self.min_data_points = min_data_points
-        self.n_splits = n_splits
-        
-        self.price_history = []
-        self.shares_held = 0.0
-        self.entry_prices = []
-        self.available_cash = 10000.0  # Fixed initial balance
-        self.total_invested = 0.0
-        self.cross_val_means = []
-        self.last_action = 0
-        
-    def reset(self):
-        """Reset agent state"""
-        self.price_history = []
-        self.shares_held = 0.0
-        self.entry_prices = []
-        self.available_cash = 10000.0  # Reset to fixed amount
-        self.total_invested = 0.0
-        self.cross_val_means = []
-        self.last_action = 0
-        
-    def set_initial_balance(self, initial_balance: float):
-        """Set initial balance separately"""
-        self.available_cash = initial_balance
-        
-    def _calculate_cross_val_means(self) -> List[float]:
-        """Calculate means for n equal parts of the dataset"""
-        if len(self.price_history) < self.min_data_points:
-            return []
-            
-        # Split data into n equal parts
-        split_size = len(self.price_history) // self.n_splits
-        means = []
-        
-        for i in range(self.n_splits):
-            start_idx = i * split_size
-            end_idx = start_idx + split_size
-            if end_idx > len(self.price_history):
-                end_idx = len(self.price_history)
-                
-            split_data = self.price_history[start_idx:end_idx]
-            if split_data:  # Ensure we have data in this split
-                means.append(np.mean(split_data))
-                
-        return means
-        
-    def _get_current_mean(self) -> float:
-        """Get weighted mean of cross-validation means"""
-        if not self.cross_val_means:
-            return 0
-            
-        # Recent splits get higher weight
-        weights = np.linspace(0.5, 1.5, len(self.cross_val_means))
-        weighted_mean = np.average(self.cross_val_means, weights=weights)
-        return weighted_mean
-        
-    def _should_buy(self, current_price: float) -> bool:
-        """Determine if we should buy based on statistical mean"""
-        if not self.cross_val_means or self.available_cash < 100:
-            return False
-            
-        current_mean = self._get_current_mean()
-        if current_mean == 0:
-            return False
-            
-        # Buy if price is significantly below mean AND we have cash
-        price_ratio = current_price / current_mean
-        return price_ratio <= (1 - self.long_threshold)
-        
-    def _calculate_shares_to_buy(self, current_price: float) -> float:
-        """Calculate how many shares to buy"""
-        if self.available_cash < 100:
-            return 0
-            
-        # Use 50% of available cash per trade
-        investment_amount = self.available_cash * 0.5
-        return investment_amount / current_price
-        
-    def act(self, observation: dict) -> int:
-        """
-        Generate trading action - Only buy, never sell
-        Returns: 1 (buy), 0 (hold)
+        Continuous trading based on latest price points
+        Returns: 1 (buy), -1 (sell), 0 (hold)
         """
         price = self._extract_price(observation)
         if price is None:
@@ -395,123 +130,239 @@ class StatisticalMeanAgent(BaseAgent):
         # Add to price history
         self.price_history.append(price)
         
+        # Update means periodically
+        if len(self.price_history) % 20 == 0 or len(self.price_history) < self.min_data_points:
+            self.cross_val_means = self._calculate_cross_val_means()
+            
         # Wait for sufficient data
         if len(self.price_history) < self.min_data_points:
             return 0
             
-        # Update cross-validation means periodically
-        if len(self.price_history) % 30 == 0:  # Update every 30 steps
-            self.cross_val_means = self._calculate_cross_val_means()
-            
-        # Check if we should buy
-        should_buy = self._should_buy(price)
+        # Calculate trading signals based on LATEST price
+        signals = self._calculate_trading_signals(price)
         
-        if should_buy:
-            shares_to_buy = self._calculate_shares_to_buy(price)
-            
+        # EXECUTE BUY
+        if signals['buy'] and self.available_cash >= self.min_trade_amount:
+            shares_to_buy = self._calculate_position_size(price, 'buy')
             if shares_to_buy > 0:
-                # Execute buy
-                investment_amount = shares_to_buy * price
+                investment = shares_to_buy * price
                 self.shares_held += shares_to_buy
                 self.entry_prices.append(price)
-                self.available_cash -= investment_amount
-                self.total_invested += investment_amount
+                self.available_cash -= investment
+                self.total_invested += investment
+                self.current_position = 1
                 self.last_action = 1
                 return 1  # Buy signal
                 
+        # EXECUTE SELL
+        elif signals['sell'] and self.shares_held > 0:
+            shares_to_sell = self._calculate_position_size(price, 'sell')
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * price
+                self.shares_held -= shares_to_sell
+                self.available_cash += proceeds
+                self.current_position = 0
+                self.last_action = -1
+                return -1  # Sell signal
+                
+        # HOLD - no action
         self.last_action = 0
-        return 0  # Hold
+        return 0
         
-    def get_portfolio_value(self, current_price: float) -> float:
-        """Calculate total portfolio value"""
-        stock_value = self.shares_held * current_price
-        return stock_value + self.available_cash
+    def get_current_value(self, current_price: float) -> float:
+        """Get current portfolio value"""
+        return self.available_cash + (self.shares_held * current_price)
         
-    def get_performance_stats(self, current_price: float) -> dict:
-        """Get detailed performance statistics"""
-        total_value = self.get_portfolio_value(current_price)
-        avg_entry = np.mean(self.entry_prices) if self.entry_prices else 0
-        
+    def get_status(self, current_price: float) -> dict:
+        """Get current agent status"""
         return {
-            'total_value': total_value,
-            'available_cash': self.available_cash,
-            'shares_held': self.shares_held,
-            'total_invested': self.total_invested,
-            'average_entry_price': avg_entry,
-            'unrealized_pnl': (current_price - avg_entry) * self.shares_held if avg_entry > 0 else 0,
-            'total_return_pct': (total_value / 10000.0 - 1) * 100  # Based on fixed 10k
+            'cash': self.available_cash,
+            'shares': self.shares_held,
+            'position': self.current_position,
+            'portfolio_value': self.get_current_value(current_price),
+            'last_action': self.last_action,
+            'data_points': len(self.price_history)
         }
 
-    def _extract_price(self, observation: dict) -> float:
-        """Extract price from observation"""
-        try:
-            price_data = observation['price']
-            if isinstance(price_data, (float, int)):
-                return float(price_data)
-            elif isinstance(price_data, pd.Series):
-                return float(price_data.iloc[-1])
-            elif isinstance(price_data, np.ndarray):
-                return float(price_data.item()) if price_data.size == 1 else float(price_data[-1])
-            else:
-                return float(price_data)
-        except (KeyError, ValueError, TypeError):
-            return None
+
+
+class ContinuousTradingAgent(StatisticalMeanAgent):
+    """Continuous trading with profit protection"""
+    def __init__(self, 
+                 long_threshold: float = 0.05,    # 5% below mean
+                 short_threshold: float = 0.05,   # 5% above mean  
+                 position_size: float = 0.5,      # 50% of cash per trade
+                 min_data_points: int = 30,
+                 stop_loss_pct: float = 0.10,     # 10% max loss before forced sell
+                 min_profit_pct: float = 0.02,    # 2% minimum profit to sell
+                 allow_loss_selling: bool = False): # Whether to allow selling at loss
+        
+        super().__init__(
+            long_threshold=long_threshold,
+            short_threshold=short_threshold,
+            position_size=position_size,
+            min_data_points=min_data_points
+        )
+        
+        self.stop_loss_pct = stop_loss_pct
+        self.min_profit_pct = min_profit_pct
+        self.allow_loss_selling = allow_loss_selling
+        self.entry_price = 0.0  # Track average entry price
+        
+    def _calculate_average_entry_price(self) -> float:
+        """Calculate weighted average entry price"""
+        if not self.entry_prices or self.shares_held <= 0:
+            return 0.0
+            
+        # For simplicity, use simple average
+        # In production, you might want weighted average by purchase size
+        return np.mean(self.entry_prices)
+        
+    def _calculate_profit_loss(self, current_price: float) -> float:
+        """Calculate current profit/loss percentage"""
+        avg_entry = self._calculate_average_entry_price()
+        if avg_entry == 0:
+            return 0.0
+            
+        return (current_price - avg_entry) / avg_entry
+        
+    def _should_sell_based_on_profit(self, current_price: float) -> bool:
+        """Determine if selling is allowed based on profit/loss"""
+        if self.shares_held <= 0:
+            return False
+            
+        profit_pct = self._calculate_profit_loss(current_price)
+        
+        # 1. STOP LOSS: Force sell if loss exceeds threshold
+        if profit_pct <= -self.stop_loss_pct:
+            print(f"STOP LOSS triggered: {profit_pct:.1%} loss")
+            return True
+            
+        # 2. MIN PROFIT: Only sell if we have minimum profit
+        if profit_pct >= self.min_profit_pct:
+            print(f"Profit target reached: {profit_pct:.1%} gain")
+            return True
+            
+        # 3. ALLOW LOSS SELLING: If explicitly enabled
+        if self.allow_loss_selling and profit_pct < 0:
+            print(f"Selling at loss (allowed): {profit_pct:.1%}")
+            return True
+            
+        # 4. PREVENT SELLING AT LOSS
+        print(f"Prevented selling: {profit_pct:.1%} (below {self.min_profit_pct:.1%} profit)")
+        return False
+        
+    def _calculate_trading_signals(self, current_price: float) -> dict:
+        """More sensitive signals with profit protection"""
+        signals = super()._calculate_trading_signals(current_price)
+        
+        # Override sell signal with profit check
+        if signals['sell']:
+            signals['sell'] = self._should_sell_based_on_profit(current_price)
+        
+        # Additional: Buy on any dip when we're not invested
+        if (not signals['buy'] and self.current_position == 0 and 
+            self.available_cash >= self.min_trade_amount):
+            recent_avg = np.mean(self.price_history[-20:]) if len(self.price_history) >= 20 else 0
+            if recent_avg > 0 and current_price < recent_avg * 0.98:
+                signals['buy'] = True
+                signals['hold'] = False
+                
+        return signals
+        
+    def act(self, observation: dict) -> int:
+        """Enhanced act method with profit protection"""
+        price = self._extract_price(observation)
+        if price is None:
+            return 0
+            
+        self.price_history.append(price)
+        
+        if len(self.price_history) % 20 == 0 or len(self.price_history) < self.min_data_points:
+            self.cross_val_means = self._calculate_cross_val_means()
+            
+        if len(self.price_history) < self.min_data_points:
+            return 0
+            
+        signals = self._calculate_trading_signals(price)
+        
+        # EXECUTE BUY
+        if signals['buy'] and self.available_cash >= self.min_trade_amount:
+            shares_to_buy = self._calculate_position_size(price, 'buy')
+            if shares_to_buy > 0:
+                investment = shares_to_buy * price
+                self.shares_held += shares_to_buy
+                self.entry_prices.append(price)  # Track entry price
+                self.available_cash -= investment
+                self.total_invested += investment
+                self.current_position = 1
+                self.last_action = 1
+                print(f"BUY: {shares_to_buy:.2f} shares at ${price:.2f}")
+                return 1
+                
+        # EXECUTE SELL (with profit protection)
+        elif signals['sell'] and self.shares_held > 0:
+            profit_pct = self._calculate_profit_loss(price)
+            shares_to_sell = self._calculate_position_size(price, 'sell')
+            
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * price
+                self.shares_held -= shares_to_sell
+                self.available_cash += proceeds
+                
+                # Remove sold shares from entry prices (FIFO)
+                shares_remaining = self.shares_held
+                self.entry_prices = self.entry_prices[-int(shares_remaining):] if shares_remaining > 0 else []
+                
+                self.current_position = 0 if self.shares_held <= 0 else 1
+                self.last_action = -1
+                print(f"SELL: {shares_to_sell:.2f} shares at ${price:.2f} ({profit_pct:+.1%})")
+                return -1
+                
+        self.last_action = 0
+        return 0
+        
+    def get_status(self, current_price: float) -> dict:
+        """Enhanced status with profit information"""
+        status = super().get_status(current_price)
+        profit_pct = self._calculate_profit_loss(current_price)
+        
+        status.update({
+            'profit_pct': profit_pct * 100,  # as percentage
+            'stop_loss_pct': self.stop_loss_pct * 100,
+            'min_profit_pct': self.min_profit_pct * 100,
+            'average_entry_price': self._calculate_average_entry_price(),
+            'current_profit': profit_pct * self.total_invested if self.total_invested > 0 else 0
+        })
+        return status
 
 
 class BullMarketStatisticalAgent(StatisticalMeanAgent):
-    def __init__(self, 
+    def __init__(self,
                  long_threshold: float = 0.05,    # Only 5% below mean (more sensitive)
                  min_data_points: int = 20,       # Start trading sooner
                  n_splits: int = 3):              # Fewer splits for faster adaptation
-        
-        # Call parent constructor without initial_balance
+
         super().__init__(
             long_threshold=long_threshold,
             min_data_points=min_data_points,
-            n_splits=n_splits
+            n_splits=n_splits,
+            position_size=0.8  # Use 80% of cash
         )
-        self.position_size = 0.8  # Use 80% of cash
-        
-    def _should_buy(self, current_price: float) -> bool:
-        """More sensitive buying for bull markets"""
-        if not self.cross_val_means or self.available_cash < 100:
-            return False
-            
-        current_mean = self._get_current_mean()
-        if current_mean == 0:
-            return False
-            
-        # More sensitive: buy if not extremely overvalued
-        price_ratio = current_price / current_mean
-        return price_ratio <= 1.15  # Buy if not more than 15% above mean
-        
-    def _calculate_shares_to_buy(self, current_price: float) -> float:
-        """More aggressive position sizing"""
-        if self.available_cash < 100:
-            return 0
-            
-        investment_amount = self.available_cash * self.position_size
-        return investment_amount / current_price
 
+    def _calculate_trading_signals(self, current_price: float) -> dict:
+        """More sensitive buying for bull markets — buy if not extremely overvalued."""
+        signals = super()._calculate_trading_signals(current_price)
 
-class DebugAgent(BaseAgent):
-    """Simple agent that buys on first few steps for testing"""
-    def __init__(self):
-        self.buy_counter = 0
-        
-    def reset(self):
-        self.buy_counter = 0
-        
-    def act(self, observation):
-        self.buy_counter += 1
-        # Buy on first 5 steps to test
-        if self.buy_counter <= 5:
-            return 1
-        return 0
-        
-    def _extract_price(self, observation: dict) -> float:
-        """Extract price from observation"""
-        try:
-            return float(observation['price'])
-        except (KeyError, ValueError, TypeError):
-            return None
+        # Override buy signal: allow buying up to 15% above mean
+        if (not signals['buy'] and self.available_cash >= self.min_trade_amount
+                and self.cross_val_means):
+            current_mean = self._get_current_mean()
+            if current_mean > 0:
+                price_ratio = current_price / current_mean
+                if price_ratio <= 1.15:
+                    signals['buy'] = True
+                    signals['hold'] = False
+
+        return signals
+
